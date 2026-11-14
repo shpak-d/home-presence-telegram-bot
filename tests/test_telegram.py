@@ -1,0 +1,112 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest import IsolatedAsyncioTestCase
+from unittest.mock import AsyncMock
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.methods import AnswerCallbackQuery, SendMessage
+from aiogram.types import Message, Update
+
+from database import DEVICE_SELECT, Database, all_rows
+from presence_tracker import PresenceTracker
+from telegram_bot import build_router
+from test_presence import ADMIN, GROUP, MEMBER, PHONE, START, settings
+
+
+class BotTests(IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        context = Database.open(Path(folder.name) / "test.sqlite3")
+        self.db = await context.__aenter__()
+        self.addAsyncCleanup(context.__aexit__, None, None, None)
+        self.config = settings()
+        self.dispatcher = Dispatcher(disable_fsm=True)
+        self.dispatcher.include_router(build_router(self.db, self.config, PresenceTracker(self.db, self.config)))
+        self.session = AiohttpSession()
+        self.addAsyncCleanup(self.session.close)
+        self.session.make_request = AsyncMock(side_effect=self.respond)
+        self.bot = Bot("12345:testing", session=self.session)
+        self.group = {"type": "supergroup", "id": GROUP, "title": "Дім"}
+        self.sent = []
+        self.update_id = 0
+
+    def bot_user(self):
+        return {"id": self.bot.id, "first_name": "Presence", "is_bot": True, "username": "PresenceBot"}
+
+    def respond(self, bot, method, timeout=None):
+        self.sent.append(method)
+        if isinstance(method, AnswerCallbackQuery):
+            return True
+        if isinstance(method, SendMessage):
+            return Message.model_validate({
+                "message_id": 100 + len(self.sent), "date": START, "chat": self.group,
+                "from": self.bot_user(), "text": method.text,
+            }, context={"bot": bot})
+        raise AssertionError(type(method))
+
+    async def feed(self, **item):
+        self.update_id += 1
+        update = Update.model_validate({"update_id": self.update_id, **item}, context={"bot": self.bot})
+        return await self.dispatcher.feed_update(self.bot, update)
+
+    async def send(self, user, text, reply_to=None):
+        message = {
+            "message_id": self.update_id + 1, "date": START, "chat": self.group,
+            "from": {"id": user, "first_name": "Тест", "is_bot": False}, "text": text,
+        }
+        if reply_to is not None:
+            message["reply_to_message"] = {
+                "message_id": reply_to, "date": START, "chat": self.group,
+                "from": self.bot_user(), "text": "Запит",
+            }
+        return await self.feed(message=message)
+
+    async def click(self, user, data):
+        await self.feed(callback_query={
+            "id": str(self.update_id + 1), "chat_instance": "test", "data": data,
+            "from": {"id": user, "first_name": "Тест", "is_bot": False},
+            "message": {"message_id": 99, "date": START, "chat": self.group, "from": self.bot_user()},
+        })
+        return 100 + len(self.sent)
+
+    async def registered(self):
+        async with self.db.transaction() as conn:
+            return await all_rows(conn, DEVICE_SELECT)
+
+    async def test_group_registration_owner_and_notification_settings(self):
+        await self.send(ADMIN, "/devices")
+        self.assertIsInstance(self.sent[-1], SendMessage)
+        add_prompt = await self.click(ADMIN, "h:add")
+        await self.send(MEMBER, PHONE, reply_to=add_prompt)
+        self.assertFalse(await self.registered())
+        await self.send(ADMIN, PHONE, reply_to=add_prompt)
+        device, = await self.registered()
+        device_id = device["id"]
+        category_prompt = await self.click(ADMIN, f"h:category:{device_id}:0:resident")
+        await self.send(ADMIN, "iPhone Ані", reply_to=category_prompt)
+        owner_prompt = await self.click(ADMIN, f"h:edit:{device_id}:1:owner")
+        await self.send(ADMIN, f"Аня | {MEMBER}", reply_to=owner_prompt)
+        await self.click(ADMIN, f"h:toggle:{device_id}:2:monitor")
+        await self.click(ADMIN, f"h:toggle:{device_id}:3:keys_enabled")
+        recipient_prompt = await self.click(ADMIN, f"h:edit:{device_id}:4:recipient")
+        await self.send(ADMIN, str(GROUP), reply_to=recipient_prompt)
+        device, = await self.registered()
+        self.assertEqual(
+            (device["name"], device["owner_user_id"], device["monitor"], device["keys_enabled"],
+             device["recipient_chat_id"]),
+            ("iPhone Ані", MEMBER, 1, 1, GROUP),
+        )
+
+    async def test_unknown_user_and_member_cannot_change_categories(self):
+        await self.send(77777, "/devices")
+        self.assertEqual(self.sent, [])
+        add_prompt = await self.click(ADMIN, "h:add")
+        await self.send(ADMIN, PHONE, reply_to=add_prompt)
+        device, = await self.registered()
+        await self.click(MEMBER, f"h:category:{device['id']}:0:ignored")
+        self.assertTrue(self.sent[-1].show_alert)
+        changed, = await self.registered()
+        self.assertEqual(changed["category"], "unknown")
