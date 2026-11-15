@@ -6,10 +6,11 @@ from unittest.mock import AsyncMock
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.methods import AnswerCallbackQuery, SendMessage
-from aiogram.types import Message, Update
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+from aiogram.types import ForceReply, Message, Update
 
-from database import DEVICE_SELECT, Database, all_rows
+from database import DEVICE_SELECT, Database, all_rows, get_setting
 from presence_tracker import PresenceTracker
 from telegram_bot import build_router
 from test_presence import ADMIN, GROUP, MEMBER, PHONE, START, settings
@@ -19,7 +20,8 @@ class BotTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         folder = TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        context = Database.open(Path(folder.name) / "test.sqlite3")
+        self.path = Path(folder.name) / "test.sqlite3"
+        context = Database.open(self.path)
         self.db = await context.__aenter__()
         self.addAsyncCleanup(context.__aexit__, None, None, None)
         self.config = settings()
@@ -39,6 +41,8 @@ class BotTests(IsolatedAsyncioTestCase):
     def respond(self, bot, method, timeout=None):
         self.sent.append(method)
         if isinstance(method, AnswerCallbackQuery):
+            return True
+        if isinstance(method, EditMessageText):
             return True
         if isinstance(method, SendMessage):
             return Message.model_validate({
@@ -64,11 +68,11 @@ class BotTests(IsolatedAsyncioTestCase):
             }
         return await self.feed(message=message)
 
-    async def click(self, user, data):
+    async def click(self, user, data, menu_id=99):
         await self.feed(callback_query={
             "id": str(self.update_id + 1), "chat_instance": "test", "data": data,
             "from": {"id": user, "first_name": "Тест", "is_bot": False},
-            "message": {"message_id": 99, "date": START, "chat": self.group, "from": self.bot_user()},
+            "message": {"message_id": menu_id, "date": START, "chat": self.group, "from": self.bot_user()},
         })
         return 100 + len(self.sent)
 
@@ -80,9 +84,12 @@ class BotTests(IsolatedAsyncioTestCase):
         await self.send(ADMIN, "/devices")
         self.assertIsInstance(self.sent[-1], SendMessage)
         add_prompt = await self.click(ADMIN, "h:add")
+        self.assertIsInstance(self.sent[-1].reply_markup, ForceReply)
         await self.send(MEMBER, PHONE, reply_to=add_prompt)
         self.assertFalse(await self.registered())
         await self.send(ADMIN, PHONE, reply_to=add_prompt)
+        self.assertIsInstance(self.sent[-1], EditMessageText)
+        self.assertEqual(self.sent[-1].message_id, 99)
         device, = await self.registered()
         device_id = device["id"]
         category_prompt = await self.click(ADMIN, f"h:category:{device_id}:0:resident")
@@ -110,3 +117,48 @@ class BotTests(IsolatedAsyncioTestCase):
         self.assertTrue(self.sent[-1].show_alert)
         changed, = await self.registered()
         self.assertEqual(changed["category"], "unknown")
+
+    async def test_menu_navigation_edits_the_original_message(self):
+        await self.send(ADMIN, "/start")
+        menu_id = 100 + len(self.sent)
+        for page in ("devices", "settings", "start"):
+            await self.click(ADMIN, f"h:page:{page}:0", menu_id)
+
+        edits = [method for method in self.sent if isinstance(method, EditMessageText)]
+        self.assertEqual([edit.message_id for edit in edits], [menu_id] * 3)
+        self.assertEqual([edit.text.splitlines()[0] for edit in edits], ["Пристрої", "Сповіщення", "Home Presence"])
+        self.assertEqual(sum(isinstance(method, SendMessage) for method in self.sent), 1)
+
+    async def test_unchanged_menu_does_not_send_an_extra_message(self):
+        def unchanged(bot, method, timeout=None):
+            if isinstance(method, EditMessageText):
+                raise TelegramBadRequest(method, "Bad Request: message is not modified")
+            return self.respond(bot, method, timeout)
+
+        self.session.make_request.side_effect = unchanged
+        await self.click(ADMIN, "h:page:start:0")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIsInstance(self.sent[0], AnswerCallbackQuery)
+
+    async def test_night_mode_setting_is_admin_only_and_persists(self):
+        await self.send(ADMIN, "/settings")
+        menu_id = 100 + len(self.sent)
+        self.assertIn("Нічний режим: увімкнено · 23:00–09:00 (Europe/Kyiv)", self.sent[-1].text)
+        self.assertIn("h:night:0", [
+            button.callback_data for row in self.sent[-1].reply_markup.inline_keyboard for button in row
+        ])
+        await self.click(MEMBER, "h:night:0", menu_id)
+        self.assertTrue(self.sent[-1].show_alert)
+        async with self.db.transaction() as conn:
+            self.assertEqual(await get_setting(conn, "night_mode", 1), 1)
+
+        await self.click(ADMIN, "h:night:0", menu_id)
+        self.assertIsInstance(self.sent[-1], EditMessageText)
+        self.assertEqual(self.sent[-1].message_id, menu_id)
+        self.assertIn("Нічний режим: вимкнено", self.sent[-1].text)
+        async with Database.open(self.path) as reopened:
+            await reopened.prepare_runtime(self.config.reference_mac)
+            async with reopened.transaction() as conn:
+                self.assertEqual(await get_setting(conn, "night_mode"), 0)
+        await self.click(ADMIN, "h:night:1", menu_id)
+        self.assertIn("Нічний режим: увімкнено", self.sent[-1].text)

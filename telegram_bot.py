@@ -4,6 +4,7 @@ from datetime import datetime
 
 from aiogram import BaseMiddleware, F, Router
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand, CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -12,8 +13,9 @@ from aiogram.types import (
 from config import chat_id, normalize_mac
 from database import (
     DEVICE_SELECT, add_device, all_rows, assign_category, configured_chat, device_by_id,
-    guest_by_name, one, rebind_mac, set_chat,
+    get_setting, guest_by_name, one, rebind_mac, set_night_mode, set_setting,
 )
+from presence_tracker import MORNING_CHECK_MINUTES, NIGHT_END, NIGHT_START
 
 log = logging.getLogger(__name__)
 
@@ -37,11 +39,28 @@ def keyboard(rows):
     ])
 
 
-def review_keyboard(device_id, revision):
-    return keyboard([
+def review_keyboard(device_id, revision, *, back=False):
+    rows = [
         [(CATEGORIES[key], f"category:{device_id}:{revision}:{key}") for key in ("resident", "guest")],
         [(CATEGORIES[key], f"category:{device_id}:{revision}:{key}") for key in ("ignored", "unknown")],
-    ])
+    ]
+    if back:
+        rows.append([("До картки", f"device:{device_id}")])
+    return keyboard(rows)
+
+
+async def edit_menu(message, body, markup, *, menu_id=None):
+    try:
+        await message.bot.edit_message_text(
+            chat_id=message.chat.id, message_id=menu_id or message.message_id, text=body, reply_markup=markup,
+        )
+    except TelegramBadRequest as exc:
+        error = exc.message.lower()
+        if "message is not modified" in error:
+            return
+        if "message to edit not found" not in error and "message can't be edited" not in error:
+            raise
+        await message.answer(body, reply_markup=markup)
 
 
 def bot_commands():
@@ -149,13 +168,20 @@ def build_router(db, config, tracker):
                 ]), main_menu()
             if page == "settings":
                 rules = config.rules
+                night_enabled = await get_setting(conn, "night_mode", 1)
+                night_hours = f"{NIGHT_START:%H:%M}–{NIGHT_END:%H:%M}"
+                night_state = "увімкнено" if night_enabled else "вимкнено"
                 lines = [
                     "Сповіщення", f"Підтвердження відсутності: {rules.offline_seconds} с",
                     f"Нагадування після відсутності від {rules.reminder_threshold} с",
+                    f"Нічний режим: {night_state} · {night_hours} (Europe/Kyiv)",
+                    f"Ранкова перевірка: {MORNING_CHECK_MINUTES} хв",
                     "Моніторинг, нагадування та одержувач телефону задаються в його картці.",
                 ]
                 buttons = [[("Картки пристроїв", "page:devices:0")]]
                 if is_admin:
+                    night_action = "Вимкнути" if night_enabled else "Увімкнути"
+                    buttons.append([(f"{night_action} нічний режим", f"night:{int(not night_enabled)}")])
                     buttons.append([("Дізнатися ID цього чату", "chatid")])
                     for role, label in CHAT_ROLES.items():
                         target = await configured_chat(conn, config, role)
@@ -242,9 +268,11 @@ def build_router(db, config, tracker):
             now = int(time.time())
             await conn.execute("DELETE FROM pending_registrations WHERE expires_at<=?", (now,))
             await conn.execute(
-                """INSERT INTO pending_registrations(user_id, chat_id, prompt_id, action, device_id, revision, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (query.from_user.id, prompt.chat.id, prompt.message_id, action, device_id, revision, now + PROMPT_TTL),
+                """INSERT INTO pending_registrations(
+                   user_id, chat_id, prompt_id, menu_message_id, action, device_id, revision, expires_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (query.from_user.id, prompt.chat.id, prompt.message_id, query.message.message_id,
+                 action, device_id, revision, now + PROMPT_TTL),
             )
 
     @router.callback_query(F.data.startswith("h:"))
@@ -253,7 +281,7 @@ def build_router(db, config, tracker):
         if action == "page" and len(parts) == 2 and parts[0] in COMMANDS and parts[1].isdigit():
             body, markup = await view_page(parts[0], min(int(parts[1]), 100000), is_admin)
             await query.answer()
-            await query.message.answer(body, reply_markup=markup)
+            await edit_menu(query.message, body, markup)
             return
         if action == "device" and len(parts) == 1 and parts[0].isdigit():
             async with db.transaction() as conn:
@@ -261,14 +289,24 @@ def build_router(db, config, tracker):
             await query.answer()
             if device:
                 body, markup = device_view(device, is_admin, date_text)
-                await query.message.answer(body, reply_markup=markup)
+                await edit_menu(query.message, body, markup)
             return
         if not is_admin:
             await query.answer("Ця дія доступна адміністратору.", show_alert=True)
             return
         if action == "chatid":
             await query.answer()
-            await query.message.answer(f"Chat ID: {query.message.chat.id}\nВаш user ID: {query.from_user.id}")
+            await edit_menu(
+                query.message, f"Chat ID: {query.message.chat.id}\nВаш user ID: {query.from_user.id}",
+                keyboard([[("До налаштувань", "page:settings:0")]]),
+            )
+            return
+        if action == "night" and parts in (["0"], ["1"]):
+            async with db.transaction() as conn:
+                await set_night_mode(conn, parts[0] == "1")
+            await query.answer()
+            body, markup = await view_page("settings", 0, is_admin)
+            await edit_menu(query.message, body, markup)
             return
         if action == "chat" and len(parts) == 1 and parts[0] in CHAT_ROLES:
             await query.answer()
@@ -318,6 +356,7 @@ def build_router(db, config, tracker):
                     )
                     await conn.execute("UPDATE devices SET revision=revision+1 WHERE id=?", (device_id,))
                     if option == "monitor":
+                        await conn.execute("DELETE FROM night_holds WHERE device_id=?", (device_id,))
                         await conn.execute(
                             """UPDATE devices SET status='unknown', negative_since=NULL, positive_count=0,
                                positive_since=NULL WHERE id=?""", (device_id,)
@@ -333,10 +372,10 @@ def build_router(db, config, tracker):
         if prompt:
             await start_prompt(query, *prompt, device_id, revision)
         elif action == "review":
-            await query.message.answer("Оберіть категорію.", reply_markup=review_keyboard(device_id, revision))
+            await edit_menu(query.message, "Оберіть категорію.", review_keyboard(device_id, revision, back=True))
         else:
             body, markup = device_view(device, is_admin, date_text)
-            await query.message.answer(body, reply_markup=markup)
+            await edit_menu(query.message, body, markup)
 
     def label(text):
         clean = " ".join(text.split())
@@ -362,7 +401,7 @@ def build_router(db, config, tracker):
             if target is None:
                 await conn.execute("DELETE FROM bot_settings WHERE key=?", (role,))
             else:
-                await set_chat(conn, role, target)
+                await set_setting(conn, role, target)
             return None
         if action == "add":
             mac = normalize_mac(text)
@@ -421,6 +460,8 @@ def build_router(db, config, tracker):
             return
         address = (message.from_user.id, message.chat.id, message.reply_to_message.message_id)
         keep_prompt = False
+        menu_id = None
+        refresh_settings = False
         async with db.transaction() as conn:
             pending = await one(
                 conn, "SELECT * FROM pending_registrations WHERE user_id=? AND chat_id=? AND prompt_id=?", address
@@ -440,14 +481,21 @@ def build_router(db, config, tracker):
                     keep_prompt = True
                     response = f"{exc} Дайте нову відповідь на початковий запит.", None
                 else:
+                    menu_id = pending["menu_message_id"]
                     if device_id is None:
                         response = "Одержувача збережено.", main_menu()
+                        refresh_settings = menu_id is not None
                     else:
                         device = await device_by_id(conn, device_id)
                         response = device_view(device, True, date_text)
             if not keep_prompt:
                 await conn.execute("DELETE FROM pending_registrations WHERE user_id=? AND chat_id=? AND prompt_id=?", address)
-        await message.answer(response[0], reply_markup=response[1])
+        if refresh_settings:
+            response = await view_page("settings", 0, is_admin)
+        if menu_id is not None:
+            await edit_menu(message, *response, menu_id=menu_id)
+        else:
+            await message.answer(response[0], reply_markup=response[1])
 
     @router.errors()
     async def report_error(event):

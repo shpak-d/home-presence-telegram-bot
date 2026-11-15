@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS pending_registrations (
     user_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
     prompt_id INTEGER NOT NULL,
+    menu_message_id INTEGER,
     action TEXT NOT NULL,
     device_id INTEGER REFERENCES devices(id),
     revision INTEGER,
@@ -68,6 +69,10 @@ CREATE TABLE IF NOT EXISTS pending_registrations (
 );
 CREATE INDEX IF NOT EXISTS pending_expiry ON pending_registrations(expires_at);
 CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS night_holds (
+    device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    morning_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS scan_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     last_scan INTEGER,
@@ -93,10 +98,12 @@ CREATE INDEX IF NOT EXISTS outbox_due ON outbox(status, available_at, id);
 DEVICE_SELECT = """
 SELECT d.*, g.name AS guest_name, COALESCE(n.monitor, 0) AS monitor,
        COALESCE(n.keys_enabled, 0) AS keys_enabled,
-       COALESCE(n.presence_alerts, 0) AS presence_alerts, n.recipient_chat_id
+       COALESCE(n.presence_alerts, 0) AS presence_alerts, n.recipient_chat_id,
+       h.morning_at AS night_morning_at
 FROM devices d
 LEFT JOIN guests g ON g.id = d.guest_id
 LEFT JOIN notification_settings n ON n.device_id = d.id
+LEFT JOIN night_holds h ON h.device_id = d.id
 """
 
 RESET_CANDIDATES = """
@@ -128,20 +135,32 @@ async def device_by_id(conn, device_id):
 
 
 async def configured_chat(conn, settings, role):
-    override = await one(conn, "SELECT value FROM bot_settings WHERE key=?", (role,))
-    if override is not None:
-        allowed = settings.admins | settings.group_ids if role == "admin" else settings.recipients
-        if override["value"] in allowed:
-            return override["value"]
+    override = await get_setting(conn, role)
+    allowed = settings.admins | settings.group_ids if role == "admin" else settings.recipients
+    if override in allowed:
+        return override
     return settings.default_chats[role]
 
 
-async def set_chat(conn, role, target):
+async def get_setting(conn, key, default=None):
+    row = await one(conn, "SELECT value FROM bot_settings WHERE key=?", (key,))
+    return default if row is None else row["value"]
+
+
+async def set_setting(conn, key, value):
     await conn.execute(
         "INSERT INTO bot_settings(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (role, target),
+        (key, value),
     )
+
+
+async def set_night_mode(conn, enabled):
+    await set_setting(conn, "night_mode", int(enabled))
+    if not enabled:
+        await conn.execute(RESET_CANDIDATES + " WHERE id IN (SELECT device_id FROM night_holds)")
+        await conn.execute("DELETE FROM night_holds")
+        await conn.execute("DELETE FROM bot_settings WHERE key='night_capture'")
 
 
 async def guest_by_name(conn, name):
@@ -152,6 +171,7 @@ async def guest_by_name(conn, name):
 
 
 async def assign_category(conn, device_id, category, *, name=None, guest_id=None):
+    await conn.execute("DELETE FROM night_holds WHERE device_id=?", (device_id,))
     await conn.execute(
         """UPDATE devices SET category=?, name=COALESCE(?, name), guest_id=?,
            owner_name='', owner_user_id=NULL, revision=revision+1,
@@ -183,6 +203,7 @@ async def rebind_mac(conn, device, mac):
         await conn.execute("UPDATE outbox SET review_device_id=NULL WHERE review_device_id=?", (target["id"],))
         await conn.execute("DELETE FROM notification_settings WHERE device_id=?", (target["id"],))
         await conn.execute("DELETE FROM devices WHERE id=?", (target["id"],))
+    await conn.execute("DELETE FROM night_holds WHERE device_id=?", (device["id"],))
     await conn.execute(
         """UPDATE devices SET mac=?, vendor=?, ip=?, last_seen=?, revision=revision+1,
            status='unknown', negative_since=NULL,
@@ -211,7 +232,12 @@ class Database:
             await conn.execute("PRAGMA busy_timeout=5000")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executescript(SCHEMA)
-            yield cls(conn)
+            db = cls(conn)
+            async with db.transaction():
+                columns = await all_rows(conn, "PRAGMA table_info(pending_registrations)")
+                if not any(column["name"] == "menu_message_id" for column in columns):
+                    await conn.execute("ALTER TABLE pending_registrations ADD COLUMN menu_message_id INTEGER")
+            yield db
 
     @asynccontextmanager
     async def transaction(self):

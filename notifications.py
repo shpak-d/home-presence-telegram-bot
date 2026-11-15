@@ -44,10 +44,14 @@ async def announce_transition(conn, config, device, kind, event_id, absence, now
     owner_id = device["owner_user_id"]
     owner = device["owner_name"] or device["name"]
     if device["category"] == "guest":
-        if kind != "arrival":
-            return
-        guest_chat = await configured_chat(conn, config, "guest")
-        await enqueue(conn, key, guest_chat or admin_chat, f"{device['guest_name']} прийшов у гості", now)
+        if kind == "arrival":
+            body = f"{device['guest_name']} прийшов у гості"
+            await enqueue(conn, key, admin_chat, body, now)
+            guest_chat = await configured_chat(conn, config, "guest")
+            if guest_chat != admin_chat:
+                await enqueue(conn, key, guest_chat, body, now)
+        else:
+            await enqueue(conn, key, admin_chat, f"{device['guest_name']} пішов", now)
         return
 
     if device["presence_alerts"]:
