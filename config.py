@@ -5,9 +5,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
-
 MAC_PATTERN = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", re.IGNORECASE | re.ASCII)
+POLL_SECONDS = 30
 
 
 def normalize_mac(value: str) -> str:
@@ -32,11 +31,11 @@ def chat_id(value: str) -> int:
 
 @dataclass(frozen=True)
 class PresenceRules:
-    positive_scans: int = 2
+    positive_checks: int = 2
     offline_seconds: int = 300
     reminder_absence_seconds: int = 600
     reminder_quiet_seconds: int = 1200
-    max_scan_gap: int = 105
+    max_poll_gap: int = 60
 
     @property
     def reminder_threshold(self) -> int:
@@ -46,29 +45,24 @@ class PresenceRules:
 @dataclass(frozen=True, repr=False)
 class Config:
     telegram_token: str
-    api_token: str
-    api_url: str
-    reference_mac: str
+    tenda_password: str
+    tenda_url: str
     admins: frozenset[int]
     members: frozenset[int]
     group_ids: frozenset[int]
     default_chats: dict[str, int | None]
     database_path: Path
     timezone: ZoneInfo
-    poll_seconds: int
-    scan_seconds: int
     api_timeout: int
     rules: PresenceRules
     announce_initial: bool
 
     @classmethod
     def from_env(cls) -> "Config":
-        load_dotenv()
-
         def required(key: str) -> str:
             value = os.getenv(key, "").strip()
             if not value:
-                raise ValueError(f"Заповніть {key} у .env.")
+                raise ValueError(f"Задайте змінну середовища {key}.")
             return value
 
         def number(key: str, default: int, minimum: int, maximum: int) -> int:
@@ -98,20 +92,23 @@ class Config:
             chats[role] = target
         chats["admin"] = chats["admin"] or min(admins)
 
-        url_value = required("NETALERTX_URL")
+        url_value = required("TENDA_URL")
         try:
             url = urlsplit(url_value)
             port = url.port
         except ValueError:
-            raise ValueError("Перевірте хост і порт NETALERTX_URL.") from None
+            raise ValueError("Перевірте хост і порт TENDA_URL.") from None
         if (
             url.scheme not in {"http", "https"} or not url.hostname
             or url.username or url.password or url.query or url.fragment
             or url.path.rstrip("/") or any(char.isspace() for char in url_value)
         ):
-            raise ValueError("NETALERTX_URL має містити схему, хост і порт API.")
+            raise ValueError("TENDA_URL має містити схему й адресу вебінтерфейсу Tenda.")
         if port == 0:
-            raise ValueError("NETALERTX_URL містить некоректний порт.")
+            raise ValueError("TENDA_URL містить некоректний порт.")
+        password = os.getenv("TENDA_PASSWORD")
+        if not password:
+            raise ValueError("Задайте змінну середовища TENDA_PASSWORD.")
         token = required("TELEGRAM_BOT_TOKEN")
         if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
             raise ValueError("Перевірте формат TELEGRAM_BOT_TOKEN.")
@@ -119,32 +116,23 @@ class Config:
         if announce not in {"true", "false"}:
             raise ValueError("ANNOUNCE_INITIAL_DEVICES має бути true або false.")
 
-        poll = number("POLL_SECONDS", 30, 5, 300)
-        cadence = number("SCAN_SECONDS", 60, 60, 3600)
-        if poll > cadence / 2:
-            raise ValueError("POLL_SECONDS має бути щонайбільше половиною SCAN_SECONDS.")
-        default_gap = cadence + min(45, cadence // 2 + 15)
         rules = PresenceRules(
-            positive_scans=number("POSITIVE_SCANS", 2, 2, 10),
+            positive_checks=number("POSITIVE_CHECKS", 2, 2, 10),
             offline_seconds=number("OFFLINE_SECONDS", 300, 60, 86400),
             reminder_absence_seconds=number("REMINDER_ABSENCE_SECONDS", 600, 0, 86400),
             reminder_quiet_seconds=number("REMINDER_QUIET_SECONDS", 1200, 0, 86400),
-            max_scan_gap=number("MAX_SCAN_GAP_SECONDS", default_gap, cadence, 7200),
         )
         return cls(
             telegram_token=token,
-            api_token=required("API_TOKEN"),
-            api_url=url.geturl().rstrip("/"),
-            reference_mac=normalize_mac(required("REFERENCE_MAC")),
+            tenda_password=password,
+            tenda_url=url.geturl().rstrip("/"),
             admins=admins,
             members=members,
             group_ids=groups,
             default_chats=chats,
             database_path=Path(os.getenv("DATABASE_PATH", "data/presence.sqlite3")),
             timezone=ZoneInfo("Europe/Kyiv"),
-            poll_seconds=poll,
-            scan_seconds=cadence,
-            api_timeout=number("API_TIMEOUT_SECONDS", 10, 2, poll),
+            api_timeout=number("API_TIMEOUT_SECONDS", 10, 2, POLL_SECONDS),
             rules=rules,
             announce_initial=announce == "true",
         )

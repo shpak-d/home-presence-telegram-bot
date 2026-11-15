@@ -69,16 +69,11 @@ CREATE TABLE IF NOT EXISTS pending_registrations (
 );
 CREATE INDEX IF NOT EXISTS pending_expiry ON pending_registrations(expires_at);
 CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS night_holds (
-    device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
-    morning_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS scan_state (
+CREATE TABLE IF NOT EXISTS poll_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    last_scan INTEGER,
-    reference_mac TEXT
+    last_poll INTEGER
 );
-INSERT OR IGNORE INTO scan_state(singleton) VALUES (1);
+INSERT OR IGNORE INTO poll_state(singleton) VALUES (1);
 CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY,
     event_key TEXT NOT NULL,
@@ -98,12 +93,10 @@ CREATE INDEX IF NOT EXISTS outbox_due ON outbox(status, available_at, id);
 DEVICE_SELECT = """
 SELECT d.*, g.name AS guest_name, COALESCE(n.monitor, 0) AS monitor,
        COALESCE(n.keys_enabled, 0) AS keys_enabled,
-       COALESCE(n.presence_alerts, 0) AS presence_alerts, n.recipient_chat_id,
-       h.morning_at AS night_morning_at
+       COALESCE(n.presence_alerts, 0) AS presence_alerts, n.recipient_chat_id
 FROM devices d
 LEFT JOIN guests g ON g.id = d.guest_id
 LEFT JOIN notification_settings n ON n.device_id = d.id
-LEFT JOIN night_holds h ON h.device_id = d.id
 """
 
 RESET_CANDIDATES = """
@@ -155,14 +148,6 @@ async def set_setting(conn, key, value):
     )
 
 
-async def set_night_mode(conn, enabled):
-    await set_setting(conn, "night_mode", int(enabled))
-    if not enabled:
-        await conn.execute(RESET_CANDIDATES + " WHERE id IN (SELECT device_id FROM night_holds)")
-        await conn.execute("DELETE FROM night_holds")
-        await conn.execute("DELETE FROM bot_settings WHERE key='night_capture'")
-
-
 async def guest_by_name(conn, name):
     await conn.execute(
         "INSERT OR IGNORE INTO guests(name, name_key) VALUES (?, ?)", (name, name.casefold())
@@ -171,7 +156,6 @@ async def guest_by_name(conn, name):
 
 
 async def assign_category(conn, device_id, category, *, name=None, guest_id=None):
-    await conn.execute("DELETE FROM night_holds WHERE device_id=?", (device_id,))
     await conn.execute(
         """UPDATE devices SET category=?, name=COALESCE(?, name), guest_id=?,
            owner_name='', owner_user_id=NULL, revision=revision+1,
@@ -203,7 +187,6 @@ async def rebind_mac(conn, device, mac):
         await conn.execute("UPDATE outbox SET review_device_id=NULL WHERE review_device_id=?", (target["id"],))
         await conn.execute("DELETE FROM notification_settings WHERE device_id=?", (target["id"],))
         await conn.execute("DELETE FROM devices WHERE id=?", (target["id"],))
-    await conn.execute("DELETE FROM night_holds WHERE device_id=?", (device["id"],))
     await conn.execute(
         """UPDATE devices SET mac=?, vendor=?, ip=?, last_seen=?, revision=revision+1,
            status='unknown', negative_since=NULL,
@@ -250,14 +233,9 @@ class Database:
                 await self.conn.rollback()
                 raise
 
-    async def prepare_runtime(self, reference_mac: str):
+    async def prepare_runtime(self):
         async with self.transaction() as conn:
             await conn.execute(RESET_CANDIDATES)
             # A previous send may have reached Telegram before the process stopped.
             await conn.execute("UPDATE outbox SET status='uncertain' WHERE status='sending'")
             await conn.execute("DELETE FROM pending_registrations WHERE expires_at<=?", (int(time.time()),))
-            await conn.execute(
-                "UPDATE scan_state SET last_scan=NULL WHERE reference_mac IS NOT NULL AND reference_mac<>?",
-                (reference_mac,),
-            )
-            await conn.execute("UPDATE scan_state SET reference_mac=?", (reference_mac,))

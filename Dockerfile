@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && install -d -m 0700 -o presence -g presence /data \
     && install -m 0600 -o presence -g presence /dev/null /data/.initialized
 
-COPY config.py database.py main.py netalertx_client.py notifications.py presence_tracker.py telegram_bot.py ./
+COPY config.py database.py main.py notifications.py presence_tracker.py telegram_bot.py tenda_client.py ./
 USER 10001:10001
 CMD ["python", "-m", "main"]

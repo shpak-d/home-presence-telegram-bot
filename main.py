@@ -11,12 +11,12 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.methods import GetUpdates
 
-from config import Config
+from config import POLL_SECONDS, Config
 from database import Database
-from netalertx_client import NetAlertXClient
 from notifications import run_outbox
 from presence_tracker import PresenceTracker
 from telegram_bot import bot_commands, build_router, review_keyboard
+from tenda_client import TendaClient
 
 HEALTH_FILE = Path("/tmp/home-presence.alive")
 HEALTH_MAX_AGE = 120
@@ -40,7 +40,7 @@ class RedactSecrets(logging.Filter):
 def setup_logging(config):
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    handler.addFilter(RedactSecrets(config.telegram_token, config.api_token))
+    handler.addFilter(RedactSecrets(config.telegram_token, config.tenda_password))
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
@@ -80,26 +80,26 @@ async def serve(config):
     telegram_session.middleware(telegram_heartbeat)
     async with (
         Bot(config.telegram_token, session=telegram_session) as bot,
-        aiohttp.ClientSession(trust_env=False) as session,
+        aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True), trust_env=False) as session,
         Database.open(config.database_path) as db,
     ):
-        await db.prepare_runtime(config.reference_mac)
+        await db.prepare_runtime()
         webhook = await bot.get_webhook_info()
         if webhook.url:
             raise RuntimeError("Вимкніть активний webhook Telegram для використання long polling.")
         await bot.set_my_commands(bot_commands())
         tracker = PresenceTracker(db, config)
-        client = NetAlertXClient(session, config.api_url, config.api_token, config.reference_mac, config.api_timeout)
+        client = TendaClient(session, config.tenda_url, config.tenda_password, config.api_timeout)
         dispatcher = Dispatcher(disable_fsm=True)
         dispatcher.include_router(build_router(db, config, tracker))
-        log.info("Бот запущено. Інтервал читання API %s с.", config.poll_seconds)
+        log.info("Бот запущено. Інтервал опитування Tenda %s с.", POLL_SECONDS)
         tasks = [
             asyncio.create_task(dispatcher.start_polling(
                 bot, polling_timeout=20, handle_as_tasks=False, close_bot_session=False,
             ), name="telegram"),
             asyncio.create_task(tracker.run(client, lambda: tick("scan")), name="presence"),
             asyncio.create_task(run_outbox(db, config, bot, review_keyboard, lambda: tick("outbox")), name="outbox"),
-            asyncio.create_task(supervise_health(ticks, config.poll_seconds), name="health"),
+            asyncio.create_task(supervise_health(ticks, POLL_SECONDS), name="health"),
         ]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -131,7 +131,7 @@ def main() -> int:
         print(f"Помилка конфігурації. {exc}", file=sys.stderr)
         return 2
     except (OSError, KeyError):
-        print("Перевірте .env, доступ до файлів і наявність часового поясу Europe/Kyiv.", file=sys.stderr)
+        print("Перевірте змінні середовища, доступ до файлів і часовий пояс Europe/Kyiv.", file=sys.stderr)
         return 2
     setup_logging(config)
     try:

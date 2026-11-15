@@ -10,12 +10,11 @@ from aiogram.types import (
     BotCommand, CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
-from config import chat_id, normalize_mac
+from config import POLL_SECONDS, chat_id, normalize_mac
 from database import (
     DEVICE_SELECT, add_device, all_rows, assign_category, configured_chat, device_by_id,
-    get_setting, guest_by_name, one, rebind_mac, set_night_mode, set_setting,
+    guest_by_name, one, rebind_mac, set_setting,
 )
-from presence_tracker import MORNING_CHECK_MINUTES, NIGHT_END, NIGHT_START
 
 log = logging.getLogger(__name__)
 
@@ -152,15 +151,14 @@ def build_router(db, config, tracker):
         async with db.transaction() as conn:
             if page == "status":
                 state = tracker.status
-                scan = await one(conn, "SELECT last_scan FROM scan_state WHERE singleton=1")
+                poll = await one(conn, "SELECT last_poll FROM poll_state WHERE singleton=1")
                 counts = await all_rows(conn, "SELECT status, COUNT(*) AS total FROM outbox GROUP BY status")
                 statuses = {row["status"]: row["total"] for row in counts}
                 return "\n".join([
                     "Бот відповідає",
-                    f"Остання коректна відповідь NetAlertX: {date_text(state.api_ok_at)}",
-                    f"Останнє прийняте сканування: {date_text(scan['last_scan'])}",
-                    f"Інтервал API: {config.poll_seconds} с · очікуване сканування: {config.scan_seconds} с",
-                    f"Останній виміряний інтервал сканів: {state.observed_gap or '—'} с",
+                    f"Останній прийнятий список Tenda: {date_text(poll['last_poll'])}",
+                    f"Інтервал опитування: {POLL_SECONDS} с",
+                    f"Останній виміряний інтервал: {state.observed_gap or '—'} с",
                     f"Стан: {state.error or 'дані актуальні'}",
                     f"Сповіщення: очікують {statuses.get('pending', 0)}, "
                     f"прострочені {statuses.get('expired', 0)}, відхилені {statuses.get('failed', 0)}, "
@@ -168,20 +166,13 @@ def build_router(db, config, tracker):
                 ]), main_menu()
             if page == "settings":
                 rules = config.rules
-                night_enabled = await get_setting(conn, "night_mode", 1)
-                night_hours = f"{NIGHT_START:%H:%M}–{NIGHT_END:%H:%M}"
-                night_state = "увімкнено" if night_enabled else "вимкнено"
                 lines = [
                     "Сповіщення", f"Підтвердження відсутності: {rules.offline_seconds} с",
                     f"Нагадування після відсутності від {rules.reminder_threshold} с",
-                    f"Нічний режим: {night_state} · {night_hours} (Europe/Kyiv)",
-                    f"Ранкова перевірка: {MORNING_CHECK_MINUTES} хв",
                     "Моніторинг, нагадування та одержувач телефону задаються в його картці.",
                 ]
                 buttons = [[("Картки пристроїв", "page:devices:0")]]
                 if is_admin:
-                    night_action = "Вимкнути" if night_enabled else "Увімкнути"
-                    buttons.append([(f"{night_action} нічний режим", f"night:{int(not night_enabled)}")])
                     buttons.append([("Дізнатися ID цього чату", "chatid")])
                     for role, label in CHAT_ROLES.items():
                         target = await configured_chat(conn, config, role)
@@ -221,8 +212,8 @@ def build_router(db, config, tracker):
                 )
                 if page == "home":
                     state = tracker.status
-                    if state.error or not state.last_scan:
-                        lines.append("Показано останній підтверджений стан. Свіже сканування очікується.")
+                    if state.error or not state.last_poll:
+                        lines.append("Показано останній підтверджений стан. Очікується свіжа відповідь Tenda.")
                 for row in rows[:PAGE_SIZE]:
                     owner = row["guest_name"] or row["owner_name"]
                     label = f"{owner} · {row['name']}" if owner else row["name"]
@@ -301,13 +292,6 @@ def build_router(db, config, tracker):
                 keyboard([[("До налаштувань", "page:settings:0")]]),
             )
             return
-        if action == "night" and parts in (["0"], ["1"]):
-            async with db.transaction() as conn:
-                await set_night_mode(conn, parts[0] == "1")
-            await query.answer()
-            body, markup = await view_page("settings", 0, is_admin)
-            await edit_menu(query.message, body, markup)
-            return
         if action == "chat" and len(parts) == 1 and parts[0] in CHAT_ROLES:
             await query.answer()
             await start_prompt(query, f"chat_{parts[0]}", "введіть дозволений chat ID або 0 для маршруту з .env.")
@@ -356,7 +340,6 @@ def build_router(db, config, tracker):
                     )
                     await conn.execute("UPDATE devices SET revision=revision+1 WHERE id=?", (device_id,))
                     if option == "monitor":
-                        await conn.execute("DELETE FROM night_holds WHERE device_id=?", (device_id,))
                         await conn.execute(
                             """UPDATE devices SET status='unknown', negative_since=NULL, positive_count=0,
                                positive_since=NULL WHERE id=?""", (device_id,)
@@ -405,8 +388,6 @@ def build_router(db, config, tracker):
             return None
         if action == "add":
             mac = normalize_mac(text)
-            if mac == config.reference_mac:
-                raise ValueError("Контрольна MAC використовується для перевірки сканування.")
             row = await one(conn, "SELECT id FROM devices WHERE mac=?", (mac,))
             return row["id"] if row else await add_device(conn, mac, "Unknown")
         device_id = device["id"]
@@ -417,8 +398,6 @@ def build_router(db, config, tracker):
             await assign_category(conn, device_id, "guest", guest_id=guest["id"])
         elif action == "mac":
             mac = normalize_mac(text)
-            if mac == config.reference_mac:
-                raise ValueError("Контрольна MAC використовується для перевірки сканування.")
             await rebind_mac(conn, device, mac)
         elif action == "name":
             await conn.execute("UPDATE devices SET name=?, revision=revision+1 WHERE id=?", (label(text), device_id))

@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 from aiogram.types import ForceReply, Message, Update
 
-from database import DEVICE_SELECT, Database, all_rows, get_setting
+from database import DEVICE_SELECT, Database, all_rows
 from presence_tracker import PresenceTracker
 from telegram_bot import build_router
 from test_presence import ADMIN, GROUP, MEMBER, PHONE, START, settings
@@ -140,25 +140,9 @@ class BotTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertIsInstance(self.sent[0], AnswerCallbackQuery)
 
-    async def test_night_mode_setting_is_admin_only_and_persists(self):
-        await self.send(ADMIN, "/settings")
-        menu_id = 100 + len(self.sent)
-        self.assertIn("Нічний режим: увімкнено · 23:00–09:00 (Europe/Kyiv)", self.sent[-1].text)
-        self.assertIn("h:night:0", [
-            button.callback_data for row in self.sent[-1].reply_markup.inline_keyboard for button in row
-        ])
-        await self.click(MEMBER, "h:night:0", menu_id)
-        self.assertTrue(self.sent[-1].show_alert)
+    async def test_status_reports_successful_tenda_poll(self):
         async with self.db.transaction() as conn:
-            self.assertEqual(await get_setting(conn, "night_mode", 1), 1)
-
-        await self.click(ADMIN, "h:night:0", menu_id)
-        self.assertIsInstance(self.sent[-1], EditMessageText)
-        self.assertEqual(self.sent[-1].message_id, menu_id)
-        self.assertIn("Нічний режим: вимкнено", self.sent[-1].text)
-        async with Database.open(self.path) as reopened:
-            await reopened.prepare_runtime(self.config.reference_mac)
-            async with reopened.transaction() as conn:
-                self.assertEqual(await get_setting(conn, "night_mode"), 0)
-        await self.click(ADMIN, "h:night:1", menu_id)
-        self.assertIn("Нічний режим: увімкнено", self.sent[-1].text)
+            await conn.execute("UPDATE poll_state SET last_poll=? WHERE singleton=1", (START,))
+        await self.send(ADMIN, "/status")
+        self.assertIn("Останній прийнятий список Tenda:", self.sent[-1].text)
+        self.assertIn("Інтервал опитування: 30 с", self.sent[-1].text)
