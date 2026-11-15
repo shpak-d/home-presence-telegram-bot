@@ -124,7 +124,7 @@ class TendaClient:
     def __init__(self, session: aiohttp.ClientSession, url: str, password: str, timeout: int):
         self._session = session
         self._url = url.rstrip("/")
-        self._password_hash = hashlib.md5(password.encode("utf-8"), usedforsecurity=False).hexdigest().upper()
+        self._password_hash = hashlib.md5(password.encode("utf-8"), usedforsecurity=False).hexdigest()
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._lock = asyncio.Lock()
         self._key = None
@@ -194,7 +194,7 @@ class TendaClient:
     async def _login(self):
         self._clear_session()
         await self._request(
-            "POST", "/login/Auth", json={"userName": "admin", "password": self._password_hash}
+            "POST", "/login/Auth", data={"username": "admin", "password": self._password_hash}
         )
         if not self._has_cookie():
             raise TendaError("Tenda не видала cookie сесії. Перевірте TENDA_PASSWORD.")

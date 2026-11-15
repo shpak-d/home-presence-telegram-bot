@@ -30,6 +30,7 @@ class TendaProtocolTests(IsolatedAsyncioTestCase):
         self.expired = False
         self.use_stok = False
         self.key_error = False
+        self.login_reply = lambda: web.json_response({"errCode": 0})
         self.online_reply = lambda: web.json_response({"data": encrypted([DEVICE])})
         app = web.Application()
         app.router.add_post("/login/Auth", self.login)
@@ -44,12 +45,13 @@ class TendaProtocolTests(IsolatedAsyncioTestCase):
         self.client = TendaClient(session, str(server.make_url("/")), PASSWORD, 2)
 
     async def login(self, request):
-        expected_hash = hashlib.md5(PASSWORD.encode(), usedforsecurity=False).hexdigest().upper()
-        self.assertEqual(await request.json(), {"userName": "admin", "password": expected_hash})
+        expected_hash = hashlib.md5(PASSWORD.encode(), usedforsecurity=False).hexdigest()
+        self.assertEqual(request.content_type, "application/x-www-form-urlencoded")
+        self.assertEqual(dict(await request.post()), {"username": "admin", "password": expected_hash})
         self.assertFalse(request.cookies)
         self.logins += 1
         self.expired = False
-        response = web.json_response({"errCode": 0})
+        response = self.login_reply()
         response.set_cookie("password", f"login-{self.logins}", path="")
         return response
 
@@ -78,6 +80,12 @@ class TendaProtocolTests(IsolatedAsyncioTestCase):
         self.online_reply = lambda: web.Response(text=encrypted([]))
         self.assertEqual(await self.client.snapshot(), {})
         self.assertEqual((self.logins, self.key_requests), (1, 1))
+
+    async def test_form_login_accepts_302_cookie_and_fetches_sign(self):
+        self.login_reply = lambda: web.Response(status=302, headers={"Location": "/main.html"})
+        devices = await self.client.snapshot()
+        self.assertEqual(devices[MAC].name, "iPhone")
+        self.assertEqual((self.logins, self.key_requests, len(self.online_paths)), (1, 1, 1))
 
     async def test_login_redirect_refreshes_session_and_retries_list_once(self):
         await self.client.snapshot()
