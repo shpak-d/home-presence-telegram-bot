@@ -5,13 +5,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import SendMessage
 
-from config import PresenceRules
+from config import Config, PresenceRules
 from database import Database, add_device, all_rows, assign_category, device_by_id, guest_by_name, rebind_mac
 from notifications import deliver_one
 from presence_tracker import PresenceTracker
@@ -32,7 +32,7 @@ def settings(**kwargs):
         "rules": PresenceRules(), "admins": frozenset({ADMIN}),
         "members": frozenset({MEMBER}), "recipients": frozenset({ADMIN, MEMBER, GROUP}),
         "group_ids": frozenset({GROUP}), "default_chats": {"admin": ADMIN, "guest": GROUP, "discovery": GROUP},
-        "announce_initial": False, "timezone": timezone.utc,
+        "announce_initial": False, "timezone": timezone.utc, "poll_seconds": 60,
         **kwargs,
     })
 
@@ -100,6 +100,97 @@ class PresenceTests(IsolatedAsyncioTestCase):
     def start_before_night(self):
         self.config.timezone = ZoneInfo("Europe/Kyiv")
         self.start = int(datetime(2026, 11, 14, 22, 50, tzinfo=self.config.timezone).timestamp())
+
+    async def test_configured_poll_intervals_allow_jitter_but_reset_long_gaps(self):
+        device_id = await self.register()
+        devices = parse_online_list([raw_device(PHONE)])
+        for interval in (30, 60, 300):
+            with self.subTest(poll_seconds=interval), patch.dict("os.environ", {
+                "TELEGRAM_BOT_TOKEN": "12345:testing", "TENDA_PASSWORD": "test",
+                "TENDA_URL": "http://192.168.0.1", "ADMIN_USER_IDS": str(ADMIN),
+                "POLL_SECONDS": str(interval),
+            }, clear=True):
+                self.config.rules = Config.from_env().rules
+                self.config.poll_seconds = interval
+                async with self.db.transaction() as conn:
+                    await conn.execute("UPDATE devices SET status='unknown' WHERE id=?", (device_id,))
+                    await conn.execute("UPDATE poll_state SET last_poll=NULL")
+                await self.tracker.invalidate_candidates()
+                await self.tracker.process(devices, START)
+                await self.tracker.process(devices, START + interval + 1)
+                self.assertEqual((await self.device(device_id))["status"], "online")
+                # A long gap interrupts the pending absence instead of confirming departure.
+                await self.tracker.process({}, START + 2 * interval + 1)
+                resumed = START + 4 * interval + 2
+                await self.tracker.process({}, resumed)
+                self.assertEqual((await self.device(device_id))["negative_since"], resumed)
+                self.assertEqual((await self.device(device_id))["status"], "online")
+        self.assertFalse(await self.records("device_events"))
+
+    async def test_sixty_second_polls_confirm_departure_after_300_seconds(self):
+        device_id = await self.register(presence_alerts=True)
+        await self.positive(0)
+        await self.positive(1)
+        for minute in range(2, 7):
+            await self.poll(minute)
+            self.assertEqual((await self.device(device_id))["status"], "online")
+        await self.poll(7)
+        self.assertEqual((await self.device(device_id))["status"], "offline")
+        event, = await self.records("device_events")
+        self.assertEqual((event["observed_at"], event["confirmed_at"]), (START + 120, START + 420))
+
+    async def test_run_sleeps_for_configured_interval_minus_request_time(self):
+        client = SimpleNamespace(snapshot=AsyncMock(return_value={}))
+        for interval in (30, 60, 300):
+            with self.subTest(poll_seconds=interval):
+                self.config.poll_seconds = interval
+                heartbeat = Mock()
+                with (
+                    patch.object(self.tracker, "process", new=AsyncMock()),
+                    patch("presence_tracker.time.monotonic", side_effect=[100, 107]),
+                    patch("presence_tracker.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)) as sleep,
+                ):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.tracker.run(client, heartbeat)
+                sleep.assert_awaited_once_with(interval - 7)
+                heartbeat.assert_called_once_with()
+
+    async def test_api_failure_preserves_online_device_and_poll_timestamp(self):
+        device_id = await self.register(presence_alerts=True)
+        await self.positive(0)
+        await self.positive(1)
+        await self.poll(2)
+        client = SimpleNamespace(snapshot=AsyncMock(side_effect=TendaError("Tenda HTTP 503")))
+        with patch("presence_tracker.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.tracker.run(client, lambda: None)
+        device = await self.device(device_id)
+        self.assertEqual(device["status"], "online")
+        self.assertIsNone(device["negative_since"])
+        self.assertEqual(self.tracker.status.last_poll, START + 120)
+        self.assertFalse(await self.records("device_events"))
+        self.assertFalse(await self.records("outbox"))
+
+    async def test_reopen_preserves_bindings_guests_history_and_telegram_settings(self):
+        await self.register(presence_alerts=True, recipient=GROUP)
+        await self.register(GUEST, kind="guest", name="Олександр")
+        await self.positive(0)
+        await self.positive(1)
+        await self.absence(2, 8)
+        await self.tracker.invalidate_candidates()
+        async with self.db.transaction() as conn:
+            await conn.execute("INSERT INTO bot_settings VALUES ('guest', ?)", (ADMIN,))
+            await conn.execute("INSERT INTO bot_users VALUES (?, 'Аня', 1)", (MEMBER,))
+            tables = ("guests", "devices", "notification_settings", "device_events",
+                      "bot_settings", "bot_users", "outbox", "poll_state")
+            before = {table: [tuple(row) for row in await all_rows(conn, f"SELECT * FROM {table}")]
+                      for table in tables}
+        await self.connection.__aexit__(None, None, None)
+        await self.open_db()
+        async with self.db.transaction() as conn:
+            after = {table: [tuple(row) for row in await all_rows(conn, f"SELECT * FROM {table}")]
+                     for table in tables}
+        self.assertEqual(after, before)
 
     async def test_two_distinct_polls_and_ip_changes(self):
         device_id = await self.register()

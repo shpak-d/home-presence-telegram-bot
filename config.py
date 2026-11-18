@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 MAC_PATTERN = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", re.IGNORECASE | re.ASCII)
-POLL_SECONDS = 30
+DEFAULT_POLL_SECONDS = 60
 
 
 def normalize_mac(value: str) -> str:
@@ -35,7 +35,7 @@ class PresenceRules:
     offline_seconds: int = 300
     reminder_absence_seconds: int = 600
     reminder_quiet_seconds: int = 1200
-    max_poll_gap: int = 60
+    max_poll_gap: int = 2 * DEFAULT_POLL_SECONDS
 
     @property
     def reminder_threshold(self) -> int:
@@ -53,6 +53,7 @@ class Config:
     default_chats: dict[str, int | None]
     database_path: Path
     timezone: ZoneInfo
+    poll_seconds: int
     api_timeout: int
     rules: PresenceRules
     announce_initial: bool
@@ -116,11 +117,14 @@ class Config:
         if announce not in {"true", "false"}:
             raise ValueError("ANNOUNCE_INITIAL_DEVICES має бути true або false.")
 
+        poll_seconds = number("POLL_SECONDS", DEFAULT_POLL_SECONDS, 30, 300)
         rules = PresenceRules(
             positive_checks=number("POSITIVE_CHECKS", 2, 2, 10),
             offline_seconds=number("OFFLINE_SECONDS", 300, 60, 86400),
             reminder_absence_seconds=number("REMINDER_ABSENCE_SECONDS", 600, 0, 86400),
             reminder_quiet_seconds=number("REMINDER_QUIET_SECONDS", 1200, 0, 86400),
+            # Allow response-time jitter without accepting long gaps as continuous polls.
+            max_poll_gap=2 * poll_seconds,
         )
         return cls(
             telegram_token=token,
@@ -132,7 +136,8 @@ class Config:
             default_chats=chats,
             database_path=Path(os.getenv("DATABASE_PATH", "data/presence.sqlite3")),
             timezone=ZoneInfo("Europe/Kyiv"),
-            api_timeout=number("API_TIMEOUT_SECONDS", 10, 2, POLL_SECONDS),
+            poll_seconds=poll_seconds,
+            api_timeout=number("API_TIMEOUT_SECONDS", 10, 2, poll_seconds),
             rules=rules,
             announce_initial=announce == "true",
         )

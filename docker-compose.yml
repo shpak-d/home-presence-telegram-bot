@@ -2,7 +2,7 @@ name: home-presence
 
 services:
   bot:
-    image: ${BOT_IMAGE:-home-presence-bot:2}
+    image: ${BOT_IMAGE:-home-presence-bot:4}
     restart: unless-stopped
     init: true
     read_only: true
@@ -26,8 +26,9 @@ services:
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
       DISCOVERY_CHAT_ID: ${DISCOVERY_CHAT_ID:-}
       GUEST_CHAT_ID: ${GUEST_CHAT_ID:-}
+      POLL_SECONDS: ${POLL_SECONDS:-60}
       API_TIMEOUT_SECONDS: ${API_TIMEOUT_SECONDS:-10}
-      POSITIVE_CHECKS: ${POSITIVE_CHECKS:-${POSITIVE_SCANS:-2}}
+      POSITIVE_CHECKS: ${POSITIVE_CHECKS:-2}
       OFFLINE_SECONDS: ${OFFLINE_SECONDS:-300}
       REMINDER_ABSENCE_SECONDS: ${REMINDER_ABSENCE_SECONDS:-600}
       REMINDER_QUIET_SECONDS: ${REMINDER_QUIET_SECONDS:-1200}
@@ -36,9 +37,9 @@ services:
       TZ: Europe/Kyiv
     healthcheck:
       test: ["CMD", "python", "-m", "main", "--healthcheck"]
-      interval: 30s
+      interval: ${POLL_SECONDS:-60}s
       timeout: 10s
-      start_period: 60s
+      start_period: ${POLL_SECONDS:-60}s
       retries: 3
     logging:
       driver: json-file

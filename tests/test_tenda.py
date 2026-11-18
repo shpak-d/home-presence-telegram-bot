@@ -17,8 +17,8 @@ KEY = b"0123456789abcdef"
 DEVICE = {"deviceId": MAC.lower(), "devName": "iPhone", "ip": "192.168.0.42"}
 
 
-def encrypted(payload):
-    cipher = AES.new(KEY, AES.MODE_CBC, b"EU5H62G9ICGRNI43")
+def encrypted(payload, key=KEY):
+    cipher = AES.new(key, AES.MODE_CBC, b"EU5H62G9ICGRNI43")
     return base64.b64encode(cipher.encrypt(pad(json.dumps(payload).encode(), 16))).decode()
 
 
@@ -30,13 +30,15 @@ class TendaProtocolTests(IsolatedAsyncioTestCase):
         self.expired = False
         self.use_stok = False
         self.key_error = False
+        self.session_key = KEY
+        self.stok = "abcdef"
         self.login_reply = lambda: web.json_response({"errCode": 0})
         self.online_reply = lambda: web.json_response({"data": encrypted([DEVICE])})
         app = web.Application()
         app.router.add_post("/login/Auth", self.login)
         app.router.add_get("/goform/stokCfg", self.key)
         app.router.add_get("/goform/getOnlineList", self.online)
-        app.router.add_get("/;stok=abcdef/goform/getOnlineList", self.online)
+        app.router.add_get("/;stok={token}/goform/getOnlineList", self.online)
         server = TestServer(app)
         await server.start_server()
         self.addAsyncCleanup(server.close)
@@ -60,9 +62,9 @@ class TendaProtocolTests(IsolatedAsyncioTestCase):
         self.assertEqual(request.cookies.get("password"), f"login-{self.logins}")
         if self.key_error:
             raise web.HTTPServiceUnavailable()
-        payload = {"sign": KEY.decode()}
+        payload = {"sign": self.session_key.decode()}
         if self.use_stok:
-            payload["stok"] = "abcdef"
+            payload["stok"] = self.stok
         return web.json_response({"stokCfg": payload})
 
     async def online(self, request):
@@ -97,6 +99,24 @@ class TendaProtocolTests(IsolatedAsyncioTestCase):
         first, second = await asyncio.gather(self.client.snapshot(), self.client.snapshot())
         self.assertEqual(first, second)
         self.assertEqual((self.logins, self.key_requests), (1, 1))
+
+    async def test_router_reboot_after_outage_refreshes_cookie_key_and_cached_route(self):
+        self.use_stok = True
+        self.assertIn(MAC, await self.client.snapshot())
+        self.online_reply = lambda: web.Response(status=503)
+        with self.assertRaisesRegex(TendaError, "503"):
+            await self.client.snapshot()
+        # Reboot invalidates the cookie, AES key and stok route together.
+        self.expired = True
+        self.session_key = b"fedcba9876543210"
+        self.stok = "restarted"
+        self.online_reply = lambda: web.json_response({"data": encrypted([DEVICE], self.session_key)})
+        self.assertIn(MAC, await self.client.snapshot())
+        self.assertIn(MAC, await self.client.snapshot())
+        self.assertEqual((self.logins, self.key_requests), (2, 2))
+        self.assertEqual(self.online_paths[-2:], [
+            "/;stok=restarted/goform/getOnlineList", "/;stok=restarted/goform/getOnlineList",
+        ])
 
     async def test_login_html_and_unauthorized_status_refresh_session(self):
         await self.client.snapshot()

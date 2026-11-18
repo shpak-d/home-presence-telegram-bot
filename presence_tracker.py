@@ -3,7 +3,6 @@ import logging
 import time
 from dataclasses import dataclass
 
-from config import POLL_SECONDS
 from database import DEVICE_SELECT, RESET_CANDIDATES, add_device, all_rows, device_by_id, one
 from notifications import announce_device, announce_transition
 from tenda_client import DeviceReading, TendaError
@@ -182,4 +181,4 @@ class PresenceTracker:
                 else:
                     log.info("Опитування Tenda відновилося")
                 last_error = error
-            await asyncio.sleep(max(0, POLL_SECONDS - (time.monotonic() - started)))
+            await asyncio.sleep(max(0, self.config.poll_seconds - (time.monotonic() - started)))

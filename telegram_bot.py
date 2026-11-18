@@ -10,7 +10,7 @@ from aiogram.types import (
     BotCommand, CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
-from config import POLL_SECONDS, chat_id, normalize_mac
+from config import chat_id, normalize_mac
 from database import (
     DEVICE_SELECT, add_device, all_rows, assign_category, configured_chat, device_by_id,
     guest_by_name, one, rebind_mac, set_setting,
@@ -157,7 +157,7 @@ def build_router(db, config, tracker):
                 return "\n".join([
                     "Бот відповідає",
                     f"Останній прийнятий список Tenda: {date_text(poll['last_poll'])}",
-                    f"Інтервал опитування: {POLL_SECONDS} с",
+                    f"Інтервал опитування: {config.poll_seconds} с",
                     f"Останній виміряний інтервал: {state.observed_gap or '—'} с",
                     f"Стан: {state.error or 'дані актуальні'}",
                     f"Сповіщення: очікують {statuses.get('pending', 0)}, "

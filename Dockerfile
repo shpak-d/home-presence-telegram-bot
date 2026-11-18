@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 POLL_SECONDS=60
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
@@ -11,4 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY config.py database.py main.py notifications.py presence_tracker.py telegram_bot.py tenda_client.py ./
 USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["python", "-m", "main", "--healthcheck"]
 CMD ["python", "-m", "main"]

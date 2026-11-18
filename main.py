@@ -11,7 +11,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.methods import GetUpdates
 
-from config import POLL_SECONDS, Config
+from config import Config
 from database import Database
 from notifications import run_outbox
 from presence_tracker import PresenceTracker
@@ -19,6 +19,7 @@ from telegram_bot import bot_commands, build_router, review_keyboard
 from tenda_client import TendaClient
 
 HEALTH_FILE = Path("/tmp/home-presence.alive")
+# The supervisor refreshes this heartbeat every five seconds, between router polls too.
 HEALTH_MAX_AGE = 120
 log = logging.getLogger(__name__)
 
@@ -92,14 +93,14 @@ async def serve(config):
         client = TendaClient(session, config.tenda_url, config.tenda_password, config.api_timeout)
         dispatcher = Dispatcher(disable_fsm=True)
         dispatcher.include_router(build_router(db, config, tracker))
-        log.info("Бот запущено. Інтервал опитування Tenda %s с.", POLL_SECONDS)
+        log.info("Бот запущено. Інтервал опитування Tenda %s с.", config.poll_seconds)
         tasks = [
             asyncio.create_task(dispatcher.start_polling(
                 bot, polling_timeout=20, handle_as_tasks=False, close_bot_session=False,
             ), name="telegram"),
             asyncio.create_task(tracker.run(client, lambda: tick("scan")), name="presence"),
             asyncio.create_task(run_outbox(db, config, bot, review_keyboard, lambda: tick("outbox")), name="outbox"),
-            asyncio.create_task(supervise_health(ticks, POLL_SECONDS), name="health"),
+            asyncio.create_task(supervise_health(ticks, config.poll_seconds), name="health"),
         ]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

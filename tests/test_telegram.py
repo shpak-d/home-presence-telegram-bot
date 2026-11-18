@@ -145,4 +145,9 @@ class BotTests(IsolatedAsyncioTestCase):
             await conn.execute("UPDATE poll_state SET last_poll=? WHERE singleton=1", (START,))
         await self.send(ADMIN, "/status")
         self.assertIn("Останній прийнятий список Tenda:", self.sent[-1].text)
-        self.assertIn("Інтервал опитування: 30 с", self.sent[-1].text)
+        self.assertIn("Інтервал опитування: 60 с", self.sent[-1].text)
+
+    async def test_status_reports_custom_poll_interval(self):
+        self.config.poll_seconds = 300
+        await self.send(ADMIN, "/status")
+        self.assertIn("Інтервал опитування: 300 с", self.sent[-1].text)
